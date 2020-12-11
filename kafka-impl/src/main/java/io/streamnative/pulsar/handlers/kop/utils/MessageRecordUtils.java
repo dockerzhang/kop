@@ -38,6 +38,7 @@ import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.ByteBufferOutputStream;
+import org.apache.pulsar.broker.service.Consumer;
 import org.apache.pulsar.client.api.CompressionType;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.Schema;
@@ -50,6 +51,7 @@ import org.apache.pulsar.common.api.proto.PulsarApi.MessageMetadata;
 import org.apache.pulsar.common.api.proto.PulsarApi.SingleMessageMetadata;
 import org.apache.pulsar.common.compression.CompressionCodec;
 import org.apache.pulsar.common.compression.CompressionCodecProvider;
+import org.apache.pulsar.common.policies.data.ConsumerStats;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.Commands.ChecksumType;
 
@@ -334,7 +336,8 @@ public final class MessageRecordUtils {
 
     // Convert entries read from BookKeeper into Kafka Records
     // Entries can be batched messages, may need un-batch.
-    public static MemoryRecords entriesToRecords(List<org.apache.bookkeeper.mledger.Entry> entries, byte magic) {
+    public static MemoryRecords entriesToRecords(List<org.apache.bookkeeper.mledger.Entry> entries, byte magic,
+                                                 Consumer consumer) {
         try (ByteBufferOutputStream outputStream = new ByteBufferOutputStream(DEFAULT_FETCH_BUFFER_SIZE)) {
             MemoryRecordsBuilder builder = new MemoryRecordsBuilder(outputStream, magic,
                 org.apache.kafka.common.record.CompressionType.NONE,
@@ -348,10 +351,11 @@ public final class MessageRecordUtils {
                 false, false,
                 RecordBatch.NO_PARTITION_LEADER_EPOCH,
                 MAX_RECORDS_BUFFER_SIZE);
-
+            ConsumerStats consumerStats = new ConsumerStats();
             entries.parallelStream().forEachOrdered(entry -> {
                 // each entry is a batched message
                 ByteBuf metadataAndPayload = entry.getDataBuffer();
+                consumerStats.bytesOutCounter = metadataAndPayload.readableBytes();
 
                 // Uncompress the payload if necessary
                 MessageMetadata msgMetadata = Commands.parseMessageMetadata(metadataAndPayload);
@@ -365,6 +369,8 @@ public final class MessageRecordUtils {
                     throw new UncheckedIOException(ioe);
                 }
                 int numMessages = msgMetadata.getNumMessagesInBatch();
+                consumerStats.msgOutCounter = numMessages;
+
                 boolean notBatchMessage = (numMessages == 1 && !msgMetadata.hasNumMessagesInBatch());
 
                 if (log.isDebugEnabled()) {
@@ -407,7 +413,6 @@ public final class MessageRecordUtils {
                     });
                 } else {
                     Header[] headers = getHeadersFromMetadata(msgMetadata.getPropertiesList());
-
                     builder.appendWithOffset(
                         MessageIdUtils.getOffset(entry.getLedgerId(), entry.getEntryId()),
                         msgMetadata.getEventTime() > 0 ? msgMetadata.getEventTime() : msgMetadata.getPublishTime(),
@@ -420,6 +425,7 @@ public final class MessageRecordUtils {
                 payload.release();
                 entry.release();
             });
+            consumer.updateStats(consumerStats);
             return builder.build();
         } catch (IOException ioe){
             log.error("Meet IOException: {}", ioe);

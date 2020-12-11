@@ -22,6 +22,7 @@ import io.netty.util.Recycler.Handle;
 import io.streamnative.pulsar.handlers.kop.KafkaCommandDecoder.KafkaHeaderAndRequest;
 import io.streamnative.pulsar.handlers.kop.utils.KopTopic;
 import io.streamnative.pulsar.handlers.kop.utils.MessageIdUtils;
+import io.streamnative.pulsar.handlers.kop.utils.ZooKeeperUtils;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -50,6 +51,10 @@ import org.apache.kafka.common.requests.AbstractResponse;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.FetchResponse.PartitionData;
+import org.apache.pulsar.broker.service.Consumer;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.common.naming.NamespaceBundle;
+import org.apache.pulsar.common.naming.TopicName;
 
 /**
  * MessageFetchContext handling FetchRequest .
@@ -322,9 +327,45 @@ public final class MessageFetchContext {
                             } else if (apiVersion <= 3) {
                                 magic = RecordBatch.MAGIC_VALUE_V1;
                             }
+
+                            String clientHost = fetch.getClientHost();
+                            // get stored group name from zk
+                            requestHandler.getCurrentConnectedGroup().computeIfAbsent(clientHost, ignored -> {
+                                String zkSubPath = ZooKeeperUtils.groupIdPathFormat(clientHost,
+                                        fetch.getHeader().clientId());
+                                String groupId = ZooKeeperUtils.getData(requestHandler.pulsarService.getZkClient(),
+                                        requestHandler.getGroupIdStoredPath(), zkSubPath);
+                                log.info("get group name from zk for current connection:{} groupId:{}",
+                                        clientHost, groupId);
+                                return groupId;
+                            });
+                            Consumer consumer = null;
+                            try {
+                                String groupId = requestHandler.currentConnectedGroup.get(clientHost);
+                                TopicName topicName = TopicName.get(KopTopic.toString(kafkaPartition));
+                                NamespaceBundle namespaceBundle = requestHandler.pulsarService.getBrokerService()
+                                        .pulsar().getNamespaceService().getBundle(topicName);
+                                // make sure internal consumer existed
+                                requestHandler.getGroupCoordinator()
+                                        .getoffsetAcker().getConsumer(groupId, kafkaPartition).get();
+
+                                PersistentTopic persistentTopic = (PersistentTopic) requestHandler.pulsarService
+                                        .getBrokerService().getMultiLayerTopicsMap()
+                                        .get(topicName.getNamespace()).get(namespaceBundle.toString())
+                                        .get(topicName.toString());
+
+                                // only one consumer existed for internal subscription
+                                consumer = persistentTopic.getSubscriptions()
+                                        .get(groupId).getDispatcher().getConsumers().get(0);
+                            } catch (InterruptedException e) {
+                                log.error("get topic error", e);
+                            } catch (Exception e) {
+                                log.error("get topic error", e);
+                            }
+
                             MemoryRecords records;
                             // by default kafka is produced message in batched mode.
-                            records = entriesToRecords(entries, magic);
+                            records = entriesToRecords(entries, magic, consumer);
 
                             partitionData = new FetchResponse.PartitionData(
                                 Errors.NONE,
