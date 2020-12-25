@@ -52,9 +52,6 @@ import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.FetchResponse.PartitionData;
 import org.apache.pulsar.broker.service.Consumer;
-import org.apache.pulsar.broker.service.persistent.PersistentTopic;
-import org.apache.pulsar.common.naming.NamespaceBundle;
-import org.apache.pulsar.common.naming.TopicName;
 
 /**
  * MessageFetchContext handling FetchRequest .
@@ -95,6 +92,18 @@ public final class MessageFetchContext {
             KafkaHeaderAndRequest fetchRequest) {
         LinkedHashMap<TopicPartition, PartitionData<MemoryRecords>> responseData = new LinkedHashMap<>();
 
+        String clientHost = fetchRequest.getClientHost();
+        // get stored group name from zk
+        String groupName = requestHandler.getCurrentConnectedGroup().computeIfAbsent(clientHost, ignored -> {
+            String zkSubPath = ZooKeeperUtils.groupIdPathFormat(clientHost,
+                    fetchRequest.getHeader().clientId());
+            String groupId = ZooKeeperUtils.getData(requestHandler.pulsarService.getZkClient(),
+                    requestHandler.getGroupIdStoredPath(), zkSubPath);
+            log.info("get group name from zk for current connection:{} groupId:{}",
+                    clientHost, groupId);
+            return groupId;
+        });
+
         // Map of partition and related tcm.
         Map<TopicPartition, CompletableFuture<KafkaTopicConsumerManager>> topicsAndCursor =
             ((FetchRequest) fetchRequest.getRequest())
@@ -102,6 +111,11 @@ public final class MessageFetchContext {
                 .map(entry -> {
                     CompletableFuture<KafkaTopicConsumerManager> consumerManager =
                         requestHandler.getTopicManager().getTopicConsumerManager(KopTopic.toString(entry.getKey()));
+                    // make sure internal consumer existed
+                    if (groupName != null) {
+                        requestHandler.getGroupCoordinator()
+                                .getoffsetAcker().getConsumer(groupName, KopTopic.toString(entry.getKey()));
+                    }
 
                     return Pair.of(
                         entry.getKey(),
@@ -328,44 +342,12 @@ public final class MessageFetchContext {
                                 magic = RecordBatch.MAGIC_VALUE_V1;
                             }
 
-                            String clientHost = fetch.getClientHost();
-                            // get stored group name from zk
-                            requestHandler.getCurrentConnectedGroup().computeIfAbsent(clientHost, ignored -> {
-                                String zkSubPath = ZooKeeperUtils.groupIdPathFormat(clientHost,
-                                        fetch.getHeader().clientId());
-                                String groupId = ZooKeeperUtils.getData(requestHandler.pulsarService.getZkClient(),
-                                        requestHandler.getGroupIdStoredPath(), zkSubPath);
-                                log.info("get group name from zk for current connection:{} groupId:{}",
-                                        clientHost, groupId);
-                                return groupId;
-                            });
-                            Consumer consumer = null;
-                            try {
-                                String groupId = requestHandler.currentConnectedGroup.get(clientHost);
-                                TopicName topicName = TopicName.get(KopTopic.toString(kafkaPartition));
-                                NamespaceBundle namespaceBundle = requestHandler.pulsarService.getBrokerService()
-                                        .pulsar().getNamespaceService().getBundle(topicName);
-                                // make sure internal consumer existed
-                                requestHandler.getGroupCoordinator()
-                                        .getoffsetAcker().getConsumer(groupId, kafkaPartition).get();
-
-                                PersistentTopic persistentTopic = (PersistentTopic) requestHandler.pulsarService
-                                        .getBrokerService().getMultiLayerTopicsMap()
-                                        .get(topicName.getNamespace()).get(namespaceBundle.toString())
-                                        .get(topicName.toString());
-
-                                // only one consumer existed for internal subscription
-                                consumer = persistentTopic.getSubscriptions()
-                                        .get(groupId).getDispatcher().getConsumers().get(0);
-                            } catch (InterruptedException e) {
-                                log.error("get topic error", e);
-                            } catch (Exception e) {
-                                log.error("get topic error", e);
-                            }
-
                             MemoryRecords records;
+                            String groupId = requestHandler.currentConnectedGroup.get(fetch.getClientHost());
+                            CompletableFuture<Consumer> consumerFuture = requestHandler.getTopicManager()
+                                    .getGroupConsumers(groupId, KopTopic.toString(kafkaPartition));
                             // by default kafka is produced message in batched mode.
-                            records = entriesToRecords(entries, magic, consumer);
+                            records = entriesToRecords(entries, magic, consumerFuture);
 
                             partitionData = new FetchResponse.PartitionData(
                                 Errors.NONE,

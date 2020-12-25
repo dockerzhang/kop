@@ -337,7 +337,7 @@ public final class MessageRecordUtils {
     // Convert entries read from BookKeeper into Kafka Records
     // Entries can be batched messages, may need un-batch.
     public static MemoryRecords entriesToRecords(List<org.apache.bookkeeper.mledger.Entry> entries, byte magic,
-                                                 Consumer consumer) {
+                                                 CompletableFuture<Consumer> consumerFuture) {
         try (ByteBufferOutputStream outputStream = new ByteBufferOutputStream(DEFAULT_FETCH_BUFFER_SIZE)) {
             MemoryRecordsBuilder builder = new MemoryRecordsBuilder(outputStream, magic,
                 org.apache.kafka.common.record.CompressionType.NONE,
@@ -425,7 +425,14 @@ public final class MessageRecordUtils {
                 payload.release();
                 entry.release();
             });
-            consumer.updateStats(consumerStats);
+            // collect consumer stats
+            consumerFuture.whenComplete((consumer, throwable) -> {
+                if (throwable != null) {
+                    log.info("get consumer error, skip this collect stats", throwable);
+                    return;
+                }
+                consumer.updateStats(consumerStats);
+            });
             return builder.build();
         } catch (IOException ioe){
             log.error("Meet IOException: {}", ioe);

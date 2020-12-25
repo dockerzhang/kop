@@ -29,10 +29,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.service.BrokerService;
+import org.apache.pulsar.broker.service.Consumer;
 import org.apache.pulsar.broker.service.Producer;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.client.impl.Backoff;
 import org.apache.pulsar.client.impl.PulsarClientImpl;
+import org.apache.pulsar.common.naming.NamespaceBundle;
 import org.apache.pulsar.common.naming.TopicName;
 
 /**
@@ -55,6 +57,8 @@ public class KafkaTopicManager {
     private final ConcurrentHashMap<String, CompletableFuture<PersistentTopic>> topics;
     // cache for references in PersistentTopic: <topicName, producer>
     private final ConcurrentHashMap<String, Producer> references;
+    // cache for consumers for collect metrics: <groupId, Consumer>
+    private final ConcurrentHashMap<String, CompletableFuture<Consumer>> consumers;
 
     private InternalServerCnx internalServerCnx;
 
@@ -83,6 +87,7 @@ public class KafkaTopicManager {
         consumerTopicManagers = new ConcurrentHashMap<>();
         topics = new ConcurrentHashMap<>();
         references = new ConcurrentHashMap<>();
+        consumers = new ConcurrentHashMap<>();
 
         this.rwLock = new ReentrantReadWriteLock();
         this.closed = false;
@@ -405,4 +410,29 @@ public class KafkaTopicManager {
         }
     }
 
+    public CompletableFuture<Consumer> getGroupConsumers(String groupId, String topic) {
+        return consumers.computeIfAbsent(groupId, group -> {
+            CompletableFuture<Consumer> consumerFuture = new CompletableFuture<>();
+            try {
+                TopicName topicName = TopicName.get(topic);
+                NamespaceBundle namespaceBundle = requestHandler.pulsarService.getBrokerService()
+                        .pulsar().getNamespaceService().getBundle(topicName);
+                PersistentTopic persistentTopic = (PersistentTopic) requestHandler.pulsarService
+                        .getBrokerService().getMultiLayerTopicsMap()
+                        .get(topicName.getNamespace()).get(namespaceBundle.toString())
+                        .get(topicName.toString());
+                // only one consumer existed for internal subscription
+                Consumer consumer = persistentTopic.getSubscriptions()
+                        .get(groupId).getDispatcher().getConsumers().get(0);
+                consumerFuture.complete(consumer);
+            } catch (InterruptedException e) {
+                log.error("get topic error", e);
+                consumerFuture.complete(null);
+            } catch (Exception e) {
+                log.error("get topic error", e);
+                consumerFuture.complete(null);
+            }
+            return consumerFuture;
+        });
+    }
 }
